@@ -1,0 +1,11 @@
+{
+  "name": "@book/state-manager",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "build": "echo 'no build step'",
+    "lint": "echo 'no lint step'",
+    "clean": "echo 'no clean step'"
+  }
+}

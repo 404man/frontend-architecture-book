@@ -1,0 +1,11 @@
+{
+  "name": "lowcode-editor",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@book/state-manager": "workspace:*"
+  }
+}
