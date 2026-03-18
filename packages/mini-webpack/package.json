@@ -1,0 +1,15 @@
+{
+  "name": "@book/mini-webpack",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.js",
+  "bin": {
+    "mini-webpack": "index.js"
+  },
+  "scripts": {
+    "build:example": "node index.js examples/mini-webpack.config.js",
+    "run:example": "node examples/dist/bundle.js",
+    "demo": "pnpm run build:example && pnpm run run:example",
+    "clean": "rimraf examples/dist"
+  }
+}

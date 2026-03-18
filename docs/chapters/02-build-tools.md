@@ -150,6 +150,180 @@ Vite 在开发阶段不预先打包全量依赖，而是利用浏览器原生 ES
 
 这类目录划分本质上是在做“责任分层”。构建工具并不是孤立存在，而是与目录规范、依赖边界和交付策略共同组成工程系统。
 
-## 2.8 章节小结
+## 2.8 实战：mini-webpack 核心实现解析
+
+> 本节对应仓库中的 `packages/mini-webpack/index.js`，通过 265 行代码实现一个可运行的 bundler，展示构建工具的核心链路。
+
+### 2.8.1 整体架构
+
+```
+┌──────────────┐     apply()    ┌────────────────┐
+│    Plugin    │ ─────────────► │     Hooks      │
+└──────────────┘                │  run/emit/done │
+                                └───────┬────────┘
+┌──────────────┐     rules      ┌───────▼────────┐
+│    Loader    │ ◄────────────── │  MiniWebpack   │
+└──────────────┘                │                │
+                                │ _parseModule() │
+                                │ _createBundle()│
+                                │    run()       │
+                                └───────┬────────┘
+                                        │ write
+                                ┌───────▼────────┐
+                                │  bundle.js     │
+                                └────────────────┘
+```
+
+整个编译器由三部分组成：
+- **Hooks**：轻量级事件系统，为 plugin 提供生命周期扩展点；
+- **MiniWebpack**：核心编译类，负责模块图构建、代码转换、产物生成；
+- **CLI 入口**：读取配置、创建编译器实例、触发构建流程。
+
+### 2.8.2 Hooks：插件生命周期系统
+
+对应章节 2.3.2 中"plugin 通过监听编译生命周期钩子实现能力扩展"的描述。
+
+```js
+class Hooks {
+  constructor() {
+    // 三个生命周期：编译开始 / 产物生成前 / 构建完成
+    this.events = { run: [], emit: [], done: [] };
+  }
+
+  // 注册监听（类比 webpack 的 compiler.hooks.xxx.tap）
+  tap(name, fn) {
+    this.events[name].push(fn);
+  }
+
+  // 触发所有监听函数
+  call(name, payload) {
+    for (const fn of this.events[name] || []) fn(payload);
+  }
+}
+```
+
+plugin 只需实现 `apply(compiler)` 方法，通过 `compiler.hooks.tap()` 注册回调，即可在指定阶段介入构建：
+
+```js
+class BuildLogPlugin {
+  apply(compiler) {
+    compiler.hooks.tap('run',  () => console.log('[plugin] build start'));
+    compiler.hooks.tap('emit', ({ asset }) => { /* 修改产物内容 */ });
+    compiler.hooks.tap('done', () => console.log('[plugin] build done'));
+  }
+}
+```
+
+### 2.8.3 `_parseModule`：依赖递归解析，构建模块图
+
+对应章节 2.2.2 中"解析依赖关系，构建模块图"。
+
+```js
+_parseModule(filePath) {
+  const absPath = path.resolve(filePath);
+
+  // 缓存机制：同一模块只解析一次，防止循环依赖导致死循环
+  if (this.modules.has(absPath)) return this.modules.get(absPath);
+
+  const moduleId  = this._createModuleId(absPath);       // 生成模块 ID
+  const rawCode   = fs.readFileSync(absPath, 'utf-8');    // 读取源文件
+  const loadedCode = this._applyLoaders(absPath, rawCode); // 经过 loader 转换
+  const imports   = extractImports(loadedCode);           // 提取 import 语句
+
+  const dependencies = {};
+  for (const item of imports) {
+    if (!isRelativeImport(item.source)) continue; // 跳过 npm 包
+    const depAbsPath = normalizeRequest(absPath, item.source);
+    const depModule  = this._parseModule(depAbsPath); // 递归解析依赖
+    dependencies[item.source] = depModule.id;
+  }
+
+  const transformedCode = transformImports(loadedCode, dependencies); // ESM → CJS
+  const moduleInfo = { id: moduleId, filePath: absPath, dependencies, code: transformedCode };
+  this.modules.set(absPath, moduleInfo); // 写入模块图
+  return moduleInfo;
+}
+```
+
+关键点：**先缓存、再递归**，这是避免循环依赖无限递归的核心手段。
+
+### 2.8.4 `transformImports`：ESM 转 CommonJS
+
+浏览器运行产物使用 CommonJS 模块格式，因此需要把 ES Modules 语法转换为 `require/module.exports`。
+
+```js
+// import { framework } from './message'
+// ↓ 转换为
+const { framework } = __mini_require__("src/message.js");
+
+// import getMessage from './message'
+// ↓ 转换为
+const getMessage = __mini_require__("src/message.js").default || __mini_require__("src/message.js");
+
+// export const framework = "mini-webpack"
+// ↓ 转换为
+const framework = "mini-webpack";
+module.exports.framework = framework;
+
+// export default function getMessage() {...}
+// ↓ 转换为
+module.exports.default = function getMessage() {...}
+```
+
+这里的 `__mini_require__` 是最终 bundle 中的模块加载函数，并非 Node.js 的 `require`。
+
+### 2.8.5 `_createBundle`：生成 IIFE 产物
+
+对应章节 2.3.3 中"构建工具把开发期模块关系映射为运行期加载策略"。
+
+```js
+_createBundle(entryModule) {
+  // 把所有模块序列化为 key-value 记录
+  const modulesRecord = [];
+  for (const mod of this.modules.values()) {
+    modulesRecord.push(
+      `"${mod.id}": function(__mini_require__, module, exports) {\n${mod.code}\n}`
+    );
+  }
+
+  // IIFE：自执行函数隔离作用域，内置 __mini_require__ 实现模块加载
+  return `(function(modules){
+  const cache = {};
+  function __mini_require__(id){
+    if(cache[id]) return cache[id].exports;   // 缓存已加载模块
+    const module = { exports: {} };
+    cache[id] = module;
+    modules[id](__mini_require__, module, module.exports); // 执行模块
+    return module.exports;
+  }
+  __mini_require__("${entryModule.id}"); // 从入口开始运行
+})({
+  ${modulesRecord.join(",\n")}
+});`;
+}
+```
+
+这种 IIFE + 模块注册表的模式是经典的 bundle 运行时设计，Webpack 早期产物也采用类似结构。
+
+### 2.8.6 运行示例
+
+```bash
+# 在仓库根目录执行
+pnpm --filter @book/mini-webpack run demo
+```
+
+预期输出：
+
+```
+[plugin] build start
+[plugin] emit: bundle size = xxxx bytes
+[plugin] build done
+[mini-webpack] build done: .../examples/dist/bundle.js
+
+# 执行产物
+mini-webpack: build-tools chapter demo
+```
+
+## 2.9 章节小结
 
 构建工具的学习不应停留在配置项记忆，而应上升到系统抽象：输入是什么、转换链路如何组织、输出如何服务运行与交付。Webpack 与 Vite 的差异，本质是对不同阶段目标的策略取舍。真正可持续的构建优化，来自可观测、可度量、可迭代的方法论，而不是一次性调参。下一章将进一步进入状态管理体系，讨论应用运行时的数据组织问题。
